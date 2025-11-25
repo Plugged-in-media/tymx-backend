@@ -1,12 +1,16 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
-import fs from "fs";
 
-// --- Firebase Admin init ---
-const serviceAccount = JSON.parse(
-  fs.readFileSync("./firebaseServiceAccount.json", "utf8"),
-);
+// ------------------------------
+// LOAD FIREBASE SERVICE ACCOUNT
+// ------------------------------
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  console.error("❌ ERROR: FIREBASE_SERVICE_ACCOUNT env var missing!");
+  process.exit(1);
+}
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 if (!admin.apps.length) {
   admin.initializeApp({
@@ -16,10 +20,13 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// --- Express app ---
+// ------------------------------
+// EXPRESS APP SETUP
+// ------------------------------
 const app = express();
+app.use(express.json());
 
-// CORS options (allow Expo Go on iPhone, etc.)
+// CORS: required for Expo Go on iPhone + Render
 const corsOptions = {
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -27,27 +34,25 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-// Optional but recommended: handle preflight explicitly
-app.options("*", cors(corsOptions));
+app.options("*", cors(corsOptions)); // Preflight support
 
-app.use(express.json());
-
-// Health check
+// Health Check
 app.get("/", (req, res) => {
-  res.send({ status: "ok", message: "TYMX backend running" });
+  res.send({ status: "ok", message: "TYMX backend running (Render)" });
 });
 
-// Helper: server timestamp
+// Helper timestamp
 const serverTimestamp = () => admin.firestore.Timestamp.now();
 
-// --- Create event ---
+// ------------------------------
+// CREATE EVENT
+// ------------------------------
 app.post("/api/events", async (req, res) => {
   try {
-    const { name, gymId, createdBy, totalCheckpoints, stationList } = req.body;
+    const { name, createdBy, gymId, totalCheckpoints, stationList } = req.body;
 
-    if (!name || !createdBy) {
+    if (!name || !createdBy)
       return res.status(400).json({ error: "Missing required fields" });
-    }
 
     const docRef = await db.collection("events").add({
       name,
@@ -56,50 +61,59 @@ app.post("/api/events", async (req, res) => {
       status: "upcoming",
       startsAt: null,
       endsAt: null,
-      totalCheckpoints:
-        totalCheckpoints || (stationList ? stationList.length : 0),
+      totalCheckpoints: totalCheckpoints || 0,
       stationList: stationList || [],
       createdAt: serverTimestamp(),
     });
 
     res.json({ eventId: docRef.id });
   } catch (err) {
-    console.error("Error creating event:", err);
+    console.error("❌ Error creating event:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// --- Start event ---
+// ------------------------------
+// START EVENT
+// ------------------------------
 app.post("/api/events/:eventId/start", async (req, res) => {
   try {
     const { eventId } = req.params;
+
     await db.collection("events").doc(eventId).update({
       status: "active",
       startsAt: serverTimestamp(),
     });
+
     res.json({ ok: true });
   } catch (err) {
-    console.error("Error starting event:", err);
+    console.error("❌ Error starting event:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// --- Stop event ---
+// ------------------------------
+// STOP EVENT
+// ------------------------------
 app.post("/api/events/:eventId/stop", async (req, res) => {
   try {
     const { eventId } = req.params;
+
     await db.collection("events").doc(eventId).update({
       status: "completed",
       endsAt: serverTimestamp(),
     });
+
     res.json({ ok: true });
   } catch (err) {
-    console.error("Error stopping event:", err);
+    console.error("❌ Error stopping event:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// --- Checkpoint ping ---
+// ------------------------------
+// CHECKPOINT PING
+// ------------------------------
 app.post("/api/checkpoint-ping", async (req, res) => {
   try {
     const { eventId, athleteId, checkpointIndex } = req.body;
@@ -110,7 +124,7 @@ app.post("/api/checkpoint-ping", async (req, res) => {
 
     const now = serverTimestamp();
 
-    // Create ping
+    // Write ping
     const pingRef = await db.collection("pings").add({
       eventId,
       athleteId,
@@ -118,7 +132,7 @@ app.post("/api/checkpoint-ping", async (req, res) => {
       timestamp: now,
     });
 
-    // Fetch previous ping to calculate split
+    // Fetch previous ping
     const prevPingSnap = await db
       .collection("pings")
       .where("eventId", "==", eventId)
@@ -128,17 +142,16 @@ app.post("/api/checkpoint-ping", async (req, res) => {
       .limit(1)
       .get();
 
+    // Calculate split
     if (!prevPingSnap.empty) {
-      const prevDoc = prevPingSnap.docs[0];
-      const prevData = prevDoc.data();
-
-      const durationMs = now.toMillis() - prevData.timestamp.toMillis();
+      const prev = prevPingSnap.docs[0].data();
+      const durationMs = now.toMillis() - prev.timestamp.toMillis();
 
       await db.collection("splits").add({
         eventId,
         athleteId,
         segmentIndex: checkpointIndex,
-        startTimestamp: prevData.timestamp,
+        startTimestamp: prev.timestamp,
         endTimestamp: now,
         durationMs,
       });
@@ -146,24 +159,26 @@ app.post("/api/checkpoint-ping", async (req, res) => {
 
     res.json({ ok: true, pingId: pingRef.id });
   } catch (err) {
-    console.error("Error handling checkpoint ping:", err);
+    console.error("❌ Error handling ping:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// --- Get event results ---
+// ------------------------------
+// GET EVENT RESULTS
+// ------------------------------
 app.get("/api/events/:eventId/results", async (req, res) => {
   try {
     const { eventId } = req.params;
 
-    const splitsSnap = await db
+    const snap = await db
       .collection("splits")
       .where("eventId", "==", eventId)
       .get();
 
     const resultsMap = {};
 
-    splitsSnap.forEach((doc) => {
+    snap.forEach((doc) => {
       const data = doc.data();
       if (!resultsMap[data.athleteId]) {
         resultsMap[data.athleteId] = {
@@ -176,18 +191,19 @@ app.get("/api/events/:eventId/results", async (req, res) => {
       resultsMap[data.athleteId].splits.push(data);
     });
 
-    const results = Object.values(resultsMap).sort(
-      (a, b) => a.totalMs - b.totalMs,
+    const finalResults = Object.values(resultsMap).sort(
+      (a, b) => a.totalMs - b.totalMs
     );
 
-    res.json({ results });
+    res.json({ results: finalResults });
   } catch (err) {
-    console.error("Error getting results:", err);
+    console.error("❌ Error getting results:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// ------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`TYMX backend running on port ${PORT}`);
+  console.log(`🚀 TYMX backend running on port ${PORT} (Render)`);
 });
