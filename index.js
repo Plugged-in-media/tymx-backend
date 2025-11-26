@@ -539,6 +539,64 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+// ADMIN: MIGRATE STATION IDS (UUID regeneration for ALL events)
+// URL: /api/admin/migrate-stations?key=YOUR_SECRET_KEY
+// ------------------------------------------------------------
+app.post("/api/admin/migrate-stations", async (req, res) => {
+  try {
+    const ADMIN_KEY = process.env.ADMIN_MIGRATION_KEY;
+    const providedKey = req.query.key;
+
+    if (!ADMIN_KEY) {
+      return res.status(500).json({
+        error:
+          "Server missing ENV: ADMIN_MIGRATION_KEY. Add it in Render before running migration.",
+      });
+    }
+
+    if (providedKey !== ADMIN_KEY) {
+      return res.status(403).json({ error: "Invalid or missing key." });
+    }
+
+    const eventsSnap = await db.collection("events").get();
+    if (eventsSnap.empty) {
+      return res.json({ ok: true, message: "No events found." });
+    }
+
+    // Helper to generate random Firestore-like IDs
+    const genId = () => db.collection("_tmp").doc().id;
+
+    let migrated = 0;
+
+    for (const docSnap of eventsSnap.docs) {
+      const eventId = docSnap.id;
+      const data = docSnap.data();
+      const stations = data.stationList || [];
+
+      if (!stations.length) continue;
+
+      const updatedStations = stations.map((s) => ({
+        ...s,
+        id: genId(), // FORCE NEW UUID
+      }));
+
+      await docSnap.ref.update({ stationList: updatedStations });
+      migrated++;
+    }
+
+    return res.json({
+      ok: true,
+      migratedEvents: migrated,
+      message: "Station ID migration complete.",
+    });
+  } catch (err) {
+    console.error("Migration error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
 // ------------------------------
 // START SERVER
 // ------------------------------
