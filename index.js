@@ -117,10 +117,6 @@ app.post("/api/events/:eventId/stop", async (req, res) => {
 // ------------------------------------------------------------
 // UNIFIED + SAFE PING ENDPOINT
 // POST /api/events/:eventId/ping
-// - Logs ping
-// - Calculates split
-// - Updates athlete progress + checkpointTimes
-// - Prevents double pings / skipping / backwards
 // ------------------------------------------------------------
 app.post("/api/events/:eventId/ping", async (req, res) => {
   try {
@@ -159,17 +155,26 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
     }
 
     const athleteData = athleteSnap.data() || {};
-    const currentProgress =
-      typeof athleteData.progress === "number" ? athleteData.progress : -1;
 
-    // Optional: require athlete to be assigned to a wave
+    // Treat progress as "index of next checkpoint to ping"
+    let currentProgress = 0;
+    if (typeof athleteData.progress === "number") {
+      currentProgress = athleteData.progress;
+    } else if (typeof athleteData.currentCheckpoint === "number") {
+      // fallback for legacy data
+      currentProgress = athleteData.currentCheckpoint;
+    }
+
+    // Optional: require athlete wave
     if (!athleteData.wave && athleteData.wave !== 0) {
-      // If you want this strict, uncomment:
+      // uncomment if you want to enforce waves:
       // return res.status(400).json({ error: "Athlete has no wave assigned" });
     }
 
-    // 3. Prevent backwards or skipping too far
-    // Can't go backwards
+    // 3. Validation:
+    // - must ping EXACTLY the currentProgress checkpoint
+    // - less than that = backwards
+    // - greater than that = skipping
     if (checkpointIndex < currentProgress) {
       return res.status(400).json({
         error: "Backward ping not allowed",
@@ -178,17 +183,7 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
       });
     }
 
-    // Can't ping same checkpoint again (double tap)
-    if (checkpointIndex === currentProgress) {
-      return res.status(409).json({
-        error: "Duplicate ping for this checkpoint",
-        currentProgress,
-        attempted: checkpointIndex,
-      });
-    }
-
-    // Can't jump ahead more than one checkpoint
-    if (checkpointIndex > currentProgress + 1) {
+    if (checkpointIndex > currentProgress) {
       return res.status(400).json({
         error: "Cannot skip checkpoints",
         currentProgress,
@@ -198,7 +193,7 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
 
     const now = serverTimestamp();
 
-    // 4. Extra double-ping safety: check if a ping doc already exists
+    // 4. Extra double-ping safety based on existing ping docs
     const duplicateSnap = await db
       .collection("pings")
       .where("eventId", "==", eventId)
@@ -223,7 +218,7 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
       timestamp: now,
     });
 
-    // 6. Find previous ping (for split calculation)
+    // 6. Find previous ping for split calculation
     let durationMs = null;
     if (checkpointIndex > 0) {
       const prevPingSnap = await db
@@ -250,11 +245,12 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
       }
     }
 
-    // 7. Update athlete progress + checkpointTimes
+    // 7. Update athlete:
+    //    - set checkpointTimes[checkpointIndex]
+    //    - advance progress to NEXT checkpoint
     await athleteRef.set(
       {
-        // 🔥 KEY FIX: move athlete to NEXT checkpoint
-        progress: checkpointIndex + 1,
+        progress: currentProgress + 1,
         [`checkpointTimes.${checkpointIndex}`]: now,
         lastUpdatedAt: now,
       },
@@ -264,7 +260,7 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
     res.json({
       ok: true,
       pingId: pingRef.id,
-      progress: checkpointIndex + 1,
+      progress: currentProgress + 1,
       splitMs: durationMs,
     });
   } catch (err) {
@@ -304,7 +300,6 @@ app.get("/api/events/:eventId/results", async (req, res) => {
       (a, b) => a.totalMs - b.totalMs
     );
 
-    // Add rank
     finalResults = finalResults.map((r, idx) => ({
       ...r,
       rank: idx + 1,
@@ -330,32 +325,27 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
     // 1. Get all athletes
     const athletesSnap = await eventRef.collection("athletes").get();
     const athletes = [];
-    const athleteMap = {};
 
     athletesSnap.forEach((doc) => {
       const data = doc.data();
       const id = doc.id;
       const progress =
-        typeof data.progress === "number" ? data.progress : -1;
+        typeof data.progress === "number" ? data.progress : 0;
       const checkpointTimes = data.checkpointTimes || {};
       let lastTimeMs = null;
 
-      if (progress >= 0 && checkpointTimes[progress - 1]) {
-        // last completed checkpoint time
+      if (progress > 0 && checkpointTimes[progress - 1]) {
         lastTimeMs = checkpointTimes[progress - 1].toMillis();
       }
 
-      const base = {
+      athletes.push({
         athleteId: id,
         name: data.name || "",
         wave: data.wave ?? null,
         progress,
         checkpointTimes,
         lastTimeMs,
-      };
-
-      athletes.push(base);
-      athleteMap[id] = base;
+      });
     });
 
     // 2. Get totalMs per athlete from splits
@@ -371,7 +361,7 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
       totals[data.athleteId] += data.durationMs || 0;
     });
 
-    // 3. Build leaderboard array
+    // 3. Build leaderboard
     let leaderboard = athletes.map((a) => ({
       ...a,
       totalMs: totals[a.athleteId] ?? null,
@@ -379,23 +369,18 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
 
     // 4. Sort
     leaderboard.sort((a, b) => {
-      // highest progress first
       if (b.progress !== a.progress) {
         return b.progress - a.progress;
       }
 
-      // then lowest totalMs
       const aHasTotal = a.totalMs != null;
       const bHasTotal = b.totalMs != null;
-
       if (aHasTotal && bHasTotal && a.totalMs !== b.totalMs) {
         return a.totalMs - b.totalMs;
       }
 
-      // then earliest lastTimeMs
       const aHasLast = a.lastTimeMs != null;
       const bHasLast = b.lastTimeMs != null;
-
       if (aHasLast && bHasLast && a.lastTimeMs !== b.lastTimeMs) {
         return a.lastTimeMs - b.lastTimeMs;
       }
@@ -403,7 +388,6 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
       return 0;
     });
 
-    // 5. Add rank
     leaderboard = leaderboard.map((item, idx) => ({
       ...item,
       rank: idx + 1,
