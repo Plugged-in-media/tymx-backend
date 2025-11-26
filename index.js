@@ -23,11 +23,10 @@ const FieldValue = admin.firestore.FieldValue;
 const serverTimestamp = () => admin.firestore.Timestamp.now();
 
 // ------------------------------
-// EXPRESS APP
+// EXPRESS
 // ------------------------------
 const app = express();
 app.use(express.json());
-
 app.use(
   cors({
     origin: "*",
@@ -35,13 +34,14 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
 app.options("*", cors());
 
 // ------------------------------
-// HEALTH
+// HEALTH CHECK
 // ------------------------------
 app.get("/", (req, res) => {
-  res.send({ status: "ok", message: "TYMX backend running (Render)" });
+  res.send({ ok: true, message: "TYMX backend running" });
 });
 
 // ------------------------------
@@ -49,12 +49,13 @@ app.get("/", (req, res) => {
 // ------------------------------
 app.post("/api/events", async (req, res) => {
   try {
-    const { name, createdBy, gymId, totalCheckpoints, stationList } = req.body;
+    const { name, createdBy, stationList } = req.body;
+
     if (!name || !createdBy) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // Ensure stationList has stable ids
+    // Assign stable station IDs
     const normalizedStations = (stationList || []).map((s, idx) => ({
       id: s.id || `station-${idx}`,
       name: s.name || `Station ${idx + 1}`,
@@ -62,50 +63,56 @@ app.post("/api/events", async (req, res) => {
       detail: s.detail || null,
     }));
 
-    const docRef = await db.collection("events").add({
+    const ref = await db.collection("events").add({
       name,
-      gymId: gymId || null,
       createdBy,
       status: "upcoming",
-      startsAt: null,
-      endsAt: null,
       stationList: normalizedStations,
       totalCheckpoints: normalizedStations.length,
+      startsAt: null,
+      endsAt: null,
       createdAt: serverTimestamp(),
     });
 
-    res.json({ eventId: docRef.id });
+    return res.json({ eventId: ref.id });
   } catch (err) {
     console.error("❌ Error creating event:", err);
-    res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ------------------------------
-// START / STOP EVENT
+// START EVENT
 // ------------------------------
 app.post("/api/events/:eventId/start", async (req, res) => {
   try {
     const { eventId } = req.params;
+
     await db.collection("events").doc(eventId).update({
       status: "active",
       startsAt: serverTimestamp(),
     });
-    res.json({ ok: true });
+
+    return res.json({ ok: true });
   } catch (err) {
     console.error("❌ Error starting event:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// ------------------------------
+// STOP EVENT
+// ------------------------------
 app.post("/api/events/:eventId/stop", async (req, res) => {
   try {
     const { eventId } = req.params;
+
     await db.collection("events").doc(eventId).update({
       status: "completed",
       endsAt: serverTimestamp(),
     });
-    res.json({ ok: true });
+
+    return res.json({ ok: true });
   } catch (err) {
     console.error("❌ Error stopping event:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -113,7 +120,7 @@ app.post("/api/events/:eventId/stop", async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// PING: COMPLETE CURRENT STATION (START / NEXT / END)
+// PING (complete current station)
 // Body: { athleteId, stationId }
 // ------------------------------------------------------------
 app.post("/api/events/:eventId/ping", async (req, res) => {
@@ -125,67 +132,65 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
       return res.status(400).json({ error: "Missing athleteId or stationId" });
     }
 
-    // Get event
+    // Fetch event
     const eventRef = db.collection("events").doc(eventId);
     const eventSnap = await eventRef.get();
     if (!eventSnap.exists) {
       return res.status(404).json({ error: "Event not found" });
     }
     const eventData = eventSnap.data();
+
     if (eventData.status !== "active") {
       return res.status(400).json({ error: "Event not active" });
     }
 
     const stationList = eventData.stationList || [];
-    // Map of id -> index
     const stationIndexMap = {};
     stationList.forEach((s, idx) => {
-      stationIndexMap[s.id || `station-${idx}`] = idx;
+      stationIndexMap[s.id] = idx;
     });
 
     if (!(stationId in stationIndexMap)) {
       return res.status(400).json({ error: "Unknown stationId" });
     }
 
-    const thisIndex = stationIndexMap[stationId];
-
-    // Get athlete
+    // Fetch athlete
     const athleteRef = eventRef.collection("athletes").doc(athleteId);
     const athleteSnap = await athleteRef.get();
     if (!athleteSnap.exists) {
       return res.status(404).json({ error: "Athlete not found" });
     }
+    const athleteData = athleteSnap.data();
 
-    const athleteData = athleteSnap.data() || {};
-    let progress =
+    const status = athleteData.status || "ready";
+    if (status === "dnf") {
+      return res.status(400).json({ error: "Athlete is DNF" });
+    }
+
+    // Correct progress interpretation
+    const progress =
       typeof athleteData.progress === "number" && athleteData.progress >= 0
         ? athleteData.progress
         : 0;
-    const stationTimes = athleteData.stationTimes || {};
-    const status = athleteData.status || "ready";
 
-    if (status === "dnf") {
-      return res
-        .status(400)
-        .json({ error: "Athlete is DNF and cannot receive pings" });
-    }
-
-    // Expected station id given current linear model
     const expectedStation =
       stationList[progress] || stationList[stationList.length - 1];
-    const expectedId = expectedStation?.id || `station-${progress}`;
 
+    const expectedId = expectedStation.id;
+
+    // Enforce correct order (no out-of-order)
     if (stationId !== expectedId) {
-      // For now: enforce linear order.
-      // (Out-of-order handling comes later via results editor)
       return res.status(400).json({
-        error: "Out-of-order station. Please use admin tools to fix later.",
+        error:
+          "Out of order. Please complete stations in order or use admin tools.",
         expectedStationId: expectedId,
         attemptedStationId: stationId,
       });
     }
 
-    // Prevent duplicate completion of same station
+    const stationTimes = athleteData.stationTimes || {};
+
+    // Prevent duplicate completion
     if (stationTimes[stationId]) {
       return res.status(409).json({
         error: "Station already completed",
@@ -194,33 +199,34 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
     }
 
     const now = serverTimestamp();
+    const stationIndex = stationIndexMap[stationId];
 
     // Write ping
     await db.collection("pings").add({
       eventId,
       athleteId,
       stationId,
-      stationIndex: thisIndex,
+      stationIndex,
       timestamp: now,
     });
 
-    // Compute split relative to previous station completion
+    // Compute split from previous station
     let durationMs = null;
 
     if (progress > 0) {
-      const prevStation = stationList[progress - 1];
-      const prevId = prevStation?.id || `station-${progress - 1}`;
-      const prevTime = stationTimes[prevId];
+      const previousStation = stationList[progress - 1];
+      const previousId = previousStation.id;
+      const previousTime = stationTimes[previousId];
 
-      if (prevTime) {
-        durationMs = now.toMillis() - prevTime.toMillis();
+      if (previousTime) {
+        durationMs = now.toMillis() - previousTime.toMillis();
 
         await db.collection("splits").add({
           eventId,
           athleteId,
           stationId,
-          stationIndex: thisIndex,
-          startTimestamp: prevTime,
+          stationIndex,
+          startTimestamp: previousTime,
           endTimestamp: now,
           durationMs,
         });
@@ -230,7 +236,7 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
     const nextProgress = progress + 1;
     const isFinished = nextProgress >= stationList.length;
 
-    const athleteUpdate = {
+    const update = {
       progress: nextProgress,
       stationTimes: {
         ...(stationTimes || {}),
@@ -240,33 +246,30 @@ app.post("/api/events/:eventId/ping", async (req, res) => {
     };
 
     if (isFinished) {
-      athleteUpdate.status = "finished";
-      athleteUpdate.finishedAt = now;
+      update.status = "finished";
+      update.finishedAt = now;
     } else if (status === "ready") {
-      athleteUpdate.status = "active";
+      update.status = "active";
     }
 
-    await athleteRef.set(athleteUpdate, { merge: true });
+    await athleteRef.set(update, { merge: true });
 
     return res.json({
       ok: true,
-      stationId,
-      stationIndex: thisIndex,
       progress: nextProgress,
+      stationId,
+      stationIndex,
       splitMs: durationMs,
       finished: isFinished,
     });
   } catch (err) {
-    console.error("❌ Error in /ping:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("❌ Error ping:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ------------------------------------------------------------
-// ADMIN: UNDO LAST STATION (UNDO LAST ACTION)
-// - Moves progress back by 1
-// - Deletes ping + split for last station
-// - Removes that station's completion time
+// UNDO LAST STATION (corrected, no ghost stationTimes)
 // ------------------------------------------------------------
 app.post(
   "/api/events/:eventId/athletes/:athleteId/undo",
@@ -276,60 +279,58 @@ app.post(
 
       const eventRef = db.collection("events").doc(eventId);
       const eventSnap = await eventRef.get();
-      if (!eventSnap.exists) {
-        return res.status(404).json({ error: "Event not found" });
-      }
+      if (!eventSnap.exists) return res.status(404).json({ error: "Event not found" });
+
       const stationList = eventSnap.data().stationList || [];
 
       const athleteRef = eventRef.collection("athletes").doc(athleteId);
       const athleteSnap = await athleteRef.get();
-      if (!athleteSnap.exists) {
+      if (!athleteSnap.exists)
         return res.status(404).json({ error: "Athlete not found" });
-      }
 
-      const data = athleteSnap.data() || {};
-      let progress =
-        typeof data.progress === "number" && data.progress >= 0
+      const data = athleteSnap.data();
+      const progress =
+        typeof data.progress === "number" && data.progress > 0
           ? data.progress
           : 0;
 
       if (progress <= 0) {
-        return res.status(400).json({ error: "No station to undo", progress });
+        return res
+          .status(400)
+          .json({ error: "No station to undo", progress });
       }
 
       const undoIndex = progress - 1;
       const lastStation = stationList[undoIndex];
-      if (!lastStation) {
-        return res.status(400).json({ error: "Invalid station to undo" });
-      }
-      const stationId = lastStation.id || `station-${undoIndex}`;
+      const stationId = lastStation.id;
 
       const batch = db.batch();
 
-      // Delete ping doc(s) for this station
+      // 1. Delete ping(s)
       const pingsSnap = await db
         .collection("pings")
         .where("eventId", "==", eventId)
         .where("athleteId", "==", athleteId)
         .where("stationId", "==", stationId)
         .get();
-
       pingsSnap.forEach((doc) => batch.delete(doc.ref));
 
-      // Delete split(s) for this station
+      // 2. Delete split(s)
       const splitsSnap = await db
         .collection("splits")
         .where("eventId", "==", eventId)
         .where("athleteId", "==", athleteId)
         .where("stationId", "==", stationId)
         .get();
-
       splitsSnap.forEach((doc) => batch.delete(doc.ref));
 
-      // Update athlete: decrement progress, remove stationTimes entry, clear finished flag if needed
+      // 3. Remove timestamp safely
+      const stationTimes = { ...(data.stationTimes || {}) };
+      delete stationTimes[stationId];
+
       const update = {
         progress: undoIndex,
-        [`stationTimes.${stationId}`]: FieldValue.delete(),
+        stationTimes,
         lastUpdatedAt: serverTimestamp(),
       };
 
@@ -339,19 +340,22 @@ app.post(
       }
 
       batch.set(athleteRef, update, { merge: true });
-
       await batch.commit();
 
-      return res.json({ ok: true, newProgress: undoIndex, stationId });
+      return res.json({
+        ok: true,
+        undoneStationId: stationId,
+        newProgress: undoIndex,
+      });
     } catch (err) {
-      console.error("❌ Error in undo:", err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error("❌ Undo error:", err);
+      return res.status(500).json({ error: "Internal server error" });
     }
   }
 );
 
 // ------------------------------------------------------------
-// ADMIN: RESET ATHLETE (CLEAR PINGS / SPLITS / TIMES)
+// RESET ATHLETE
 // ------------------------------------------------------------
 app.post(
   "/api/events/:eventId/athletes/:athleteId/reset",
@@ -380,7 +384,6 @@ app.post(
         .get();
       splitsSnap.forEach((doc) => batch.delete(doc.ref));
 
-      // Reset athlete
       batch.set(
         athleteRef,
         {
@@ -397,14 +400,14 @@ app.post(
 
       return res.json({ ok: true });
     } catch (err) {
-      console.error("❌ Error in reset athlete:", err);
+      console.error("❌ Reset error:", err);
       res.status(500).json({ error: "Internal server error" });
     }
   }
 );
 
 // ------------------------------------------------------------
-// ADMIN: DISQUALIFY (DNF)
+// DISQUALIFY ATHLETE
 // ------------------------------------------------------------
 app.post(
   "/api/events/:eventId/athletes/:athleteId/disqualify",
@@ -428,14 +431,14 @@ app.post(
 
       return res.json({ ok: true, status: "dnf" });
     } catch (err) {
-      console.error("❌ Error in disqualify:", err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error("❌ DNF error:", err);
+      return res.status(500).json({ error: "Internal server error" });
     }
   }
 );
 
 // ------------------------------------------------------------
-// RESULTS (simple totalMs based on splits)
+// RESULTS (based on splits)
 // ------------------------------------------------------------
 app.get("/api/events/:eventId/results", async (req, res) => {
   try {
@@ -446,34 +449,34 @@ app.get("/api/events/:eventId/results", async (req, res) => {
       .where("eventId", "==", eventId)
       .get();
 
-    const resultsMap = {};
+    const totals = {};
 
     splitsSnap.forEach((doc) => {
-      const data = doc.data();
-      if (!resultsMap[data.athleteId]) {
-        resultsMap[data.athleteId] = {
-          athleteId: data.athleteId,
+      const s = doc.data();
+      if (!totals[s.athleteId]) {
+        totals[s.athleteId] = {
+          athleteId: s.athleteId,
           totalMs: 0,
           splits: [],
         };
       }
-      resultsMap[data.athleteId].totalMs += data.durationMs || 0;
-      resultsMap[data.athleteId].splits.push(data);
+      totals[s.athleteId].totalMs += s.durationMs || 0;
+      totals[s.athleteId].splits.push(s);
     });
 
-    let results = Object.values(resultsMap);
+    let results = Object.values(totals);
     results.sort((a, b) => a.totalMs - b.totalMs);
     results = results.map((r, idx) => ({ ...r, rank: idx + 1 }));
 
-    res.json({ results });
+    return res.json({ results });
   } catch (err) {
-    console.error("❌ Error in results:", err);
+    console.error("❌ Results error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // ------------------------------------------------------------
-// LEADERBOARD (by progress, then totalMs)
+// LEADERBOARD
 // ------------------------------------------------------------
 app.get("/api/events/:eventId/leaderboard", async (req, res) => {
   try {
@@ -481,27 +484,27 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
 
     const eventRef = db.collection("events").doc(eventId);
     const eventSnap = await eventRef.get();
-    const stationList = eventSnap.exists ? eventSnap.data().stationList || [] : [];
+
+    const stationCount = eventSnap.data()?.stationList?.length || 0;
 
     const athletesSnap = await eventRef.collection("athletes").get();
-    const athletes = [];
+    let athletes = [];
 
     athletesSnap.forEach((doc) => {
-      const data = doc.data();
+      const a = doc.data();
       athletes.push({
         athleteId: doc.id,
-        name: data.name || "",
+        name: a.name || "",
         progress:
-          typeof data.progress === "number" && data.progress >= 0
-            ? data.progress
+          typeof a.progress === "number" && a.progress >= 0
+            ? a.progress
             : 0,
-        status: data.status || "ready",
-        finishedAt: data.finishedAt || null,
-        stationTimes: data.stationTimes || {},
+        status: a.status || "ready",
+        finishedAt: a.finishedAt || null,
       });
     });
 
-    // TotalMs by splits
+    // Total times
     const splitsSnap = await db
       .collection("splits")
       .where("eventId", "==", eventId)
@@ -509,38 +512,36 @@ app.get("/api/events/:eventId/leaderboard", async (req, res) => {
 
     const totals = {};
     splitsSnap.forEach((doc) => {
-      const data = doc.data();
-      totals[data.athleteId] =
-        (totals[data.athleteId] || 0) + (data.durationMs || 0);
+      const s = doc.data();
+      totals[s.athleteId] =
+        (totals[s.athleteId] || 0) + (s.durationMs || 0);
     });
 
-    let leaderboard = athletes.map((a) => ({
+    athletes = athletes.map((a) => ({
       ...a,
       totalMs: totals[a.athleteId] ?? null,
     }));
 
-    leaderboard.sort((a, b) => {
-      if ((b.progress ?? 0) !== (a.progress ?? 0)) {
-        return (b.progress ?? 0) - (a.progress ?? 0);
-      }
+    athletes.sort((a, b) => {
+      if (b.progress !== a.progress) return b.progress - a.progress;
       if (a.totalMs != null && b.totalMs != null) {
         return a.totalMs - b.totalMs;
       }
       return 0;
     });
 
-    leaderboard = leaderboard.map((a, idx) => ({ ...a, rank: idx + 1 }));
+    athletes = athletes.map((a, idx) => ({ ...a, rank: idx + 1 }));
 
-    res.json({ leaderboard, stationCount: stationList.length });
+    return res.json({ leaderboard: athletes, stationCount });
   } catch (err) {
-    console.error("❌ Error in leaderboard:", err);
+    console.error("❌ Leaderboard error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ------------------------------------------------------------
+// ------------------------------
 // START SERVER
-// ------------------------------------------------------------
+// ------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 TYMX backend running on port ${PORT}`);
